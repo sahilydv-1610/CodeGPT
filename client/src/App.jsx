@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { Plus, Terminal, Bot, ChevronDown } from "lucide-react";
 import ChatWindow from "./components/ChatWindow";
 import Controls from "./components/Controls";
+import { API_BASE_URL } from "./config/api";
 
 // ─── Model Tier Colors ──────────────────────────────────────────────
 const TIER_STYLES = {
@@ -25,7 +26,8 @@ function App() {
   const [loading, setLoading] = useState(false);
 
   // ─── Model State ────────────────────────────────────────────────
-  const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
+  const DEFAULT_MODEL = "gemini-pro";
+  const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL);
   const [availableModels, setAvailableModels] = useState([]);
   const [showModelPicker, setShowModelPicker] = useState(false);
   const modelPickerRef = useRef(null);
@@ -35,7 +37,7 @@ function App() {
   // Fetch available models on mount
   // Fetch available models from server (which discovers them from Gemini API)
   const fetchModels = () => {
-    fetch("http://localhost:5000/models")
+    fetch(`${API_BASE_URL}/models`)
       .then((res) => res.json())
       .then((data) => {
         if (data.models && data.models.length > 0) {
@@ -46,7 +48,7 @@ function App() {
       .catch(() => {
         // Minimal fallback if server is unreachable
         setAvailableModels([
-          { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", tier: "fast", free: true, description: "Fast & capable" },
+          { id: "gemini-1.5-flash", name: "Gemini 1.5 Flash", tier: "fast", free: true, description: "Fast & capable" },
         ]);
       });
   };
@@ -86,7 +88,7 @@ function App() {
     setLoading(true);
 
     try {
-      const response = await fetch("http://localhost:5000/generate", {
+      const response = await fetch(`${API_BASE_URL}/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

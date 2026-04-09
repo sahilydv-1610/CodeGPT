@@ -1,17 +1,38 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const { GoogleGenAI } = require("@google/genai");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const app = express();
 const port = process.env.PORT || 5000;
 
-app.use(cors());
+// ─── CORS Configuration ──────────────────────────────────────────────
+const allowedOrigins = [
+  "http://localhost:5173",   // Vite dev server
+  "http://localhost:5174",   // Vite alt port
+  "http://localhost:3000",   // CRA / alt dev server
+  "http://127.0.0.1:5173",
+];
+
+// If a FRONTEND_URL env var is set (e.g. deployed Vercel/Netlify URL), allow it too
+if (process.env.FRONTEND_URL) {
+  allowedOrigins.push(process.env.FRONTEND_URL);
+}
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, Postman, etc.)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // In production, still allow unknown origins for public API access
+    return callback(null, true);
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-const API_KEY = process.env.GEMINI_API_KEY;
-const ai = new GoogleGenAI({ apiKey: API_KEY });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // ─── Dynamic Model Discovery ────────────────────────────────────────
 // Fetches real, working models from the Gemini API and caches them.
@@ -19,7 +40,7 @@ let cachedModels = null;
 let cacheTimestamp = 0;
 const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
-const DEFAULT_MODEL = "gemini-2.5-flash";
+const DEFAULT_MODEL = "gemini-2.5-flash"; // Gemini 2.5 Flash as stable baseline
 
 /**
  * Fetches all available models from the Gemini REST API,
@@ -27,81 +48,56 @@ const DEFAULT_MODEL = "gemini-2.5-flash";
  * a clean list with display names and tier info.
  */
 async function fetchAvailableModels() {
-  // Return cache if fresh
   if (cachedModels && (Date.now() - cacheTimestamp) < CACHE_TTL) {
     return cachedModels;
   }
 
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models?key=${API_KEY}&pageSize=100`
-    );
+    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
+    const results = await response.json();
+    const allModels = results.models || [];
+    
+    console.log(`Raw models from SDK: ${allModels.length}`);
 
-    if (!response.ok) {
-      console.error("Failed to fetch models:", response.status);
-      return getFallbackModels();
-    }
-
-    const data = await response.json();
-    const allModels = data.models || [];
-
-    // Filter: only models that support generateContent
-    const generativeModels = allModels.filter(m =>
-      m.supportedGenerationMethods?.includes("generateContent")
-    );
-
-    // Exclude non-chat models (TTS, image-only, robotics, music, etc.)
-    const EXCLUDE_PATTERNS = [
-      "tts",           // text-to-speech
-      "image",         // image generation models
-      "robotics",      // robotics models
-      "lyria",         // music models
-      "nano-banana",   // experimental
-      "computer-use",  // computer use
-      "deep-research", // deep research
-      "customtools",   // custom tools variants
-      "gemma",         // open-weight models (not Gemini API format)
-    ];
-
-    const chatModels = generativeModels.filter(m => {
+    const chatModels = allModels.filter(m => {
       const id = m.name.replace("models/", "").toLowerCase();
-      return !EXCLUDE_PATTERNS.some(pattern => id.includes(pattern));
+      
+      // Exclude non-chat models
+      const EXCLUDE_PATTERNS = ["tts", "image", "robotics", "lyria", "nano-banana", "computer-use", "deep-research", "customtools", "gemma", "embedding"];
+      if (EXCLUDE_PATTERNS.some(p => id.includes(p))) return false;
+
+      // Be very permissive: if it's a Gemini model, include it
+      return id.includes("gemini");
     });
 
-    // Build a clean, prioritized list
-    const modelList = chatModels
-      .map(m => {
-        const id = m.name.replace("models/", "");
-        return {
-          id,
-          name: m.displayName || id,
-          description: m.description?.substring(0, 80) || "",
-          tier: getTier(id),
-          free: true, // if visible via API key, it's accessible
-          inputTokenLimit: m.inputTokenLimit || 0,
-          outputTokenLimit: m.outputTokenLimit || 0,
-        };
-      })
-      // Sort: newest/best first
-      .sort((a, b) => {
+    const modelList = chatModels.map(m => {
+      const id = m.name.replace("models/", "");
+      return {
+        id,
+        name: m.displayName || id,
+        description: m.description?.substring(0, 80) || "",
+        tier: getTier(id),
+        free: true,
+      };
+    }).sort((a, b) => {
         const priority = { premium: 0, fast: 1, lite: 2 };
         const aDiff = priority[a.tier] ?? 3;
         const bDiff = priority[b.tier] ?? 3;
         if (aDiff !== bDiff) return aDiff - bDiff;
-        return a.id < b.id ? 1 : -1; // higher version numbers first
+        return a.id < b.id ? 1 : -1;
       });
 
     cachedModels = modelList;
     cacheTimestamp = Date.now();
-
-    console.log(`Discovered ${modelList.length} available models from API.`);
+    console.log(`Discovered ${modelList.length} filtered models.`);
     return modelList;
-
   } catch (err) {
-    console.error("Error fetching models:", err.message);
+    console.error("Discovery error:", err.message);
     return getFallbackModels();
   }
-}
+}    
 
 /** Determine tier from model ID */
 function getTier(id) {
@@ -113,10 +109,10 @@ function getTier(id) {
 /** Hardcoded fallback if API call fails */
 function getFallbackModels() {
   return [
-    { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", tier: "fast", free: true, description: "Fast & capable" },
-    { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash", tier: "fast", free: true, description: "Previous gen fast model" },
-    { id: "gemini-1.5-flash", name: "Gemini 1.5 Flash", tier: "fast", free: true, description: "Previous gen fast model" },
-    { id: "gemini-1.5-pro",   name: "Gemini 1.5 Pro",   tier: "premium", free: true, description: "1M context window" },
+    { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", tier: "fast", free: true, description: "Latest fast & capable model" },
+    { id: "gemini-2.5-pro",   name: "Gemini 2.5 Pro",   tier: "premium", free: true, description: "Advanced reasoning" },
+    { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash", tier: "fast", free: true, description: "Fast & capable" },
+    { id: "gemini-1.5-flash", name: "Gemini 1.5 Flash", tier: "fast", free: true, description: "Capable legacy node" },
   ];
 }
 
@@ -199,67 +195,79 @@ Provide clean, accurate, and highly helpful responses.`;
 
     while (attempts < maxAttempts) {
       try {
-        responseStream = await ai.models.generateContentStream({
-          model: usedModel,
-          contents: [{ role: "user", parts: parts }]
+        console.log(`Starting fetch attempt ${attempts + 1} for ${usedModel} (v1beta)...`);
+        
+        // ─── Direct v1beta API Call ──────────
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${usedModel}:streamGenerateContent?alt=sse&key=${process.env.GEMINI_API_KEY}`;
+        
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: parts }]
+          })
         });
-        break; // success
+
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          const status = response.status;
+          const msg = errData.error?.message || response.statusText;
+          
+          console.error(`API Error (${status}):`, msg);
+
+          if (status === 404 || msg.includes("not found")) {
+             if (usedModel !== "gemini-1.5-flash") {
+               usedModel = "gemini-1.5-flash";
+               continue;
+             }
+          }
+          throw new Error(msg);
+        }
+
+        // The response.body is a ReadableStream in Node 22+
+        responseStream = response.body; 
+        break; 
       } catch (err) {
         attempts++;
-        const status = err.status || err.code;
-
-        // Model not found — switch to default
-        if (status === 404) {
-          console.log(`Model '${usedModel}' not found (404). Falling back to ${DEFAULT_MODEL}...`);
-          res.write(`data: ${JSON.stringify({ text: `⚠️ Model \`${usedModel}\` is not available. Switching to **${DEFAULT_MODEL}**...\n\n` })}\n\n`);
-          
-          // Invalidate cache since this model shouldn't be there
-          cachedModels = null;
-          usedModel = DEFAULT_MODEL;
-          continue;
-        }
-
-        // Quota / rate limit — try waiting, then fallback
-        if (status === 429 || status === 403) {
-          if (usedModel !== DEFAULT_MODEL) {
-            console.log(`Quota exceeded for '${usedModel}'. Falling back to ${DEFAULT_MODEL}...`);
-            res.write(`data: ${JSON.stringify({ text: `⚠️ Quota exceeded for \`${usedModel}\`. Switching to **${DEFAULT_MODEL}**...\n\n` })}\n\n`);
-            usedModel = DEFAULT_MODEL;
-            continue;
-          }
-
-          // Rate limited on default model — wait and retry
-          if (attempts < maxAttempts) {
-            const waitTime = attempts * 10;
-            console.log(`Rate limited on ${usedModel}. Retrying in ${waitTime}s... (${attempts}/${maxAttempts})`);
-            res.write(`data: ${JSON.stringify({ text: `⏳ Rate limited. Retrying in ${waitTime}s...\n\n` })}\n\n`);
-            await new Promise(resolve => setTimeout(resolve, waitTime * 1000));
-            continue;
-          }
-        }
-
-        throw err; // unrecoverable
+        console.error(`Attempt ${attempts} failed:`, err.message);
+        if (attempts >= maxAttempts) throw err;
+        await new Promise(r => setTimeout(r, 2000));
       }
     }
+
+    if (!responseStream) throw new Error("No stream available.");
 
     if (usedModel !== selectedModel) {
       console.log(`Fallback used: ${selectedModel} → ${usedModel}`);
     }
     console.log("Stream created, reading chunks...");
 
+    // Node 22 fetch body is a ReadableStream. We can iterate it.
+    const decoder = new TextDecoder();
+    let buffer = "";
+
     for await (const chunk of responseStream) {
-      try {
-        let text = "";
-        if (chunk.candidates && chunk.candidates[0]?.content?.parts) {
-          for (const part of chunk.candidates[0].content.parts) {
-            if (part.text) text += part.text;
+      const chunkStr = decoder.decode(chunk, { stream: true });
+      buffer += chunkStr;
+
+      const lines = buffer.split("\n");
+      buffer = lines.pop(); // keep partial line
+
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const dataStr = line.replace("data: ", "").trim();
+          if (dataStr === "[DONE]") continue;
+
+          try {
+            const json = JSON.parse(dataStr);
+            const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (text) {
+              res.write(`data: ${JSON.stringify({ text })}\n\n`);
+            }
+          } catch (e) {
+            // Partial JSON or unexpected format
           }
         }
-        if (text) {
-          res.write(`data: ${JSON.stringify({ text })}\n\n`);
-        }
-      } catch (chunkErr) {
-        console.log("Chunk error:", chunkErr.message);
       }
     }
 
